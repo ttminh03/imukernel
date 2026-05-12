@@ -175,6 +175,28 @@ sudo modprobe -r wheeltec_imu_mod
 
 ---
 
+## Cấp quyền đọc device tự động (udev rule)
+
+Mặc định `/dev/wheeltec_imu0_*` chỉ root mới đọc được. Tạo udev rule để tự động cấp quyền mỗi lần cắm USB hoặc boot:
+
+```bash
+echo 'SUBSYSTEM=="misc", KERNEL=="wheeltec_imu*", MODE="0444"' \
+    | sudo tee /etc/udev/rules.d/99-wheeltec-imu.rules
+
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=misc
+```
+
+Kiểm tra:
+
+```bash
+ls -l /dev/wheeltec_imu0_raw /dev/wheeltec_imu0_filter
+# cr--r--r-- 1 root root ... /dev/wheeltec_imu0_raw
+# cr--r--r-- 1 root root ... /dev/wheeltec_imu0_filter
+```
+
+---
+
 ## Troubleshooting
 
 | Triệu chứng | Nguyên nhân | Cách fix |
