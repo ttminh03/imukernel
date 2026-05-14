@@ -9,6 +9,7 @@
  *   /dev/wheeltec_imuN_raw     read-only, raw IMU (gyro + accel + mag)
  *   /dev/wheeltec_imuN_filter  read-only, AHRS filtered (euler + quaternion)
  *   /dev/wheeltec_imuN_state   read-only, text status
+ *   /dev/wheeltec_imuN_ctrl    write-only, control commands (e.g. "freboot")
  *
  * Targeted at kernel 6.12+, PREEMPT_RT-safe.
  */
@@ -153,6 +154,9 @@ struct wheeltec_dev {
 	size_t			bulk_in_size;
 	__u8			bulk_in_addr;
 
+	/* Bulk OUT */
+	__u8			bulk_out_addr;
+
 	/* Frame parser (single-producer: URB completion) */
 	u8			fbuf[FRAME_BUF_SIZE];
 	size_t			fbuf_len;
@@ -185,15 +189,23 @@ struct wheeltec_dev {
 	struct miscdevice	mdev_raw;
 	struct miscdevice	mdev_filter;
 	struct miscdevice	mdev_state;
+	struct miscdevice	mdev_ctrl;
 	char			name_raw[32];
 	char			name_filter[32];
 	char			name_state[32];
+	char			name_ctrl[32];
 
 	int			id;
 
 	/* URB error recovery */
 	struct work_struct	urb_retry_work;
 	atomic_t		urb_err_cnt;    /* consecutive transient errors */
+
+	/* Firmware reboot (runs in system_wq to allow msleep) */
+	struct work_struct	reboot_work;
+	atomic_t		reboot_pending;
+	/* 0=idle, 1=in-progress, 2=success, 3=warning(no stream) */
+	atomic_t		reboot_status;
 
 	struct kref		kref;
 	struct mutex		io_mutex;
@@ -203,6 +215,7 @@ struct wheeltec_dev {
 #define to_wdev_raw(f)    container_of((f)->private_data, struct wheeltec_dev, mdev_raw)
 #define to_wdev_filter(f) container_of((f)->private_data, struct wheeltec_dev, mdev_filter)
 #define to_wdev_state(f)  container_of((f)->private_data, struct wheeltec_dev, mdev_state)
+#define to_wdev_ctrl(f)   container_of((f)->private_data, struct wheeltec_dev, mdev_ctrl)
 
 static DEFINE_IDA(wheeltec_ida);
 
@@ -227,6 +240,182 @@ static u16 wheeltec_crc16(const u8 *data, size_t len)
 	for (i = 0; i < len; i++)
 		crc = (crc << 8) ^ cp_crc16_table[((crc >> 8) ^ data[i]) & 0xff];
 	return crc;
+}
+
+/* Forward declarations — defined later in this file */
+static int cp210x_ctrl_out(struct usb_device *udev, u8 req, u16 val);
+static int cp210x_setup(struct usb_device *udev, u32 baud);
+static void wheeltec_read_complete(struct urb *urb);
+
+/* ---------- Bulk OUT helper ---------- */
+
+static int wt_bulk_write(struct wheeltec_dev *wd, const void *buf, size_t len)
+{
+	unsigned char *kbuf;
+	int actual, ret;
+
+	kbuf = kmemdup(buf, len, GFP_KERNEL);
+	if (!kbuf)
+		return -ENOMEM;
+
+	ret = usb_bulk_msg(wd->udev,
+			   usb_sndbulkpipe(wd->udev, wd->bulk_out_addr),
+			   kbuf, len, &actual, 2000);
+	kfree(kbuf);
+	return ret;
+}
+
+/* ---------- Firmware reboot sequence (workqueue context) ---------- */
+
+/*
+ * Mirrors RobotNet12 ImuControl.RebootAsync():
+ *
+ *  1. #fconfig  → 800ms  → purge RX
+ *  2. #freboot  → 1500ms → purge RX
+ *  3. y         → 800ms
+ *  4. Invalidate snapshots + reset EMA state (readers will block)
+ *  5. Flush parser buffer
+ *  6. Wait 15s for firmware to boot
+ *  7. Verify: count 0xFC frame-heads arriving in next 12s
+ *     ≥5 heads → SUCCESS, else WARNING
+ */
+static void wt_reboot_work_fn(struct work_struct *work)
+{
+	struct wheeltec_dev *wd =
+		container_of(work, struct wheeltec_dev, reboot_work);
+	u64 frames_before;
+	int i;
+
+	atomic_set(&wd->reboot_status, 1); /* in-progress */
+
+	if (wd->disconnected)
+		goto aborted;
+
+	frames_before = atomic64_read(&wd->raw_frames_ok)
+		      + atomic64_read(&wd->filter_frames_ok);
+
+	/*
+	 * IMU đang stream binary 400Hz liên tục — UART RX của CP2102 bận.
+	 * Disable UART trước để buffer sạch, gửi lệnh xong rồi enable lại.
+	 * Nếu không làm bước này, lệnh ASCII bị lẫn vào giữa binary stream,
+	 * IMU không nhận ra và tiếp tục stream — không vào config mode.
+	 */
+	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_DISABLE);
+	msleep(100);
+	cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
+	msleep(50);
+	mutex_lock(&wd->io_mutex);
+	wd->fbuf_len = 0;
+	mutex_unlock(&wd->io_mutex);
+	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_ENABLE);
+	msleep(50);
+
+	// dev_info(&wd->intf->dev, "freboot: sending #fconfig\n");
+	// wt_bulk_write(wd, "#fconfig\r\n", 10);
+	// msleep(800);
+	// cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	dev_info(&wd->intf->dev, "freboot: sending #freboot\n");
+	wt_bulk_write(wd, "#freboot\r\n", 10);
+	msleep(1500);
+	cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	dev_info(&wd->intf->dev, "freboot: sending y\n");
+	wt_bulk_write(wd, "y\r\n", 3);
+
+	/*
+	 * After "y", the CP2102 firmware reboots — USB disconnect follows.
+	 * Two possible outcomes:
+	 *
+	 * A) USB disconnect happens → wheeltec_disconnect sets disconnected=true
+	 *    → our 15s loop exits early → wheeltec_probe re-runs on reconnect
+	 *    → new wd is created, streams normally.  We set SUCCESS here.
+	 *
+	 * B) Only UART resets (no USB disconnect) → disconnected stays false
+	 *    → we wait 15s, re-setup CP2102, verify frames ourselves.
+	 */
+	msleep(800); /* give device time to start rebooting */
+
+	/* Invalidate stale snapshots */
+	atomic_set(&wd->has_raw,    0);
+	atomic_set(&wd->has_filter, 0);
+	write_seqcount_begin(&wd->raw_seq);
+	wd->raw_snap.hz = 0;
+	write_seqcount_end(&wd->raw_seq);
+	write_seqcount_begin(&wd->filter_seq);
+	wd->filter_snap.hz = 0;
+	write_seqcount_end(&wd->filter_seq);
+	wd->raw_last_hw_ts    = 0; wd->raw_period_avg    = 0;
+	wd->filter_last_hw_ts = 0; wd->filter_period_avg = 0;
+	mutex_lock(&wd->io_mutex);
+	wd->fbuf_len = 0;
+	mutex_unlock(&wd->io_mutex);
+
+	dev_info(&wd->intf->dev, "freboot: waiting up to 15s for device to reboot...\n");
+	for (i = 0; i < 15; i++) {
+		msleep(1000);
+		/* Scenario A: USB disconnect happened → new probe will handle it */
+		if (wd->disconnected) {
+			dev_info(&wd->intf->dev,
+				 "freboot: USB disconnect detected — reboot in progress, new probe will reconnect\n");
+			atomic_set(&wd->reboot_status, 2); /* SUCCESS via USB reconnect */
+			atomic_set(&wd->reboot_pending, 0);
+			return;
+		}
+	}
+
+	/*
+	 * Scenario B: still connected after 15s — CP2102 did not USB-disconnect.
+	 * Re-setup UART and verify the stream resumed on its own.
+	 */
+	dev_info(&wd->intf->dev, "freboot: device still connected, re-setting up UART\n");
+
+	mutex_lock(&wd->io_mutex);
+	wd->fbuf_len = 0;
+	mutex_unlock(&wd->io_mutex);
+	atomic_set(&wd->urb_err_cnt, 0);
+	cp210x_setup(wd->udev, default_baud);
+	msleep(2000); /* let IMU settle and start streaming */
+
+	mutex_lock(&wd->io_mutex);
+	wd->fbuf_len = 0;
+	mutex_unlock(&wd->io_mutex);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	{
+		u64 frames_now = atomic64_read(&wd->raw_frames_ok)
+			       + atomic64_read(&wd->filter_frames_ok);
+		int new_frames = (int)min_t(u64, frames_now - frames_before, INT_MAX);
+
+		dev_info(&wd->intf->dev,
+			 "freboot: verify — new_frames=%d (before=%llu now=%llu)\n",
+			 new_frames, frames_before, frames_now);
+
+		if (new_frames >= 5) {
+			dev_info(&wd->intf->dev,
+				 "freboot: SUCCESS — %d frames detected\n", new_frames);
+			atomic_set(&wd->reboot_status, 2);
+		} else {
+			dev_warn(&wd->intf->dev,
+				 "freboot: WARNING — only %d frames after reboot\n", new_frames);
+			atomic_set(&wd->reboot_status, 3);
+		}
+	}
+	atomic_set(&wd->reboot_pending, 0);
+	return;
+
+	aborted:
+		dev_info(&wd->intf->dev, "freboot: aborted (disconnected before command sequence completed)\n");
+		atomic_set(&wd->reboot_status, 0);
+		atomic_set(&wd->reboot_pending, 0);
 }
 
 /* ---------- CP210x init helpers ---------- */
@@ -493,6 +682,26 @@ static void wheeltec_read_complete(struct urb *urb)
 	if (urb->actual_length > 0) {
 		size_t copy_len  = urb->actual_length;
 		size_t free_space = FRAME_BUF_SIZE - wd->fbuf_len;
+
+		/* Khi đang reboot: dump bytes ra dmesg để debug,
+		 * bỏ qua parse_buffer (data là ASCII response, không phải FDILink) */
+		if (atomic_read(&wd->reboot_pending)) {
+			u8 *buf = urb->transfer_buffer;
+			size_t len = urb->actual_length;
+			/* In printable ASCII, thay non-printable bằng '.' */
+			char tmp[65];
+			size_t i, chunk;
+			for (i = 0; i < len; i += 64) {
+				chunk = min(len - i, (size_t)64);
+				size_t j;
+				for (j = 0; j < chunk; j++)
+					tmp[j] = (buf[i+j] >= 32 && buf[i+j] < 127) ? buf[i+j] : '.';
+				tmp[chunk] = '\0';
+				dev_info(&wd->intf->dev, "freboot rx: [%s]\n", tmp);
+			}
+			goto resubmit;
+		}
+
 		if (copy_len > free_space) {
 			wd->fbuf_len  = 0;
 			free_space    = FRAME_BUF_SIZE;
@@ -502,6 +711,8 @@ static void wheeltec_read_complete(struct urb *urb)
 		wd->fbuf_len += copy_len;
 		parse_buffer(wd);
 	}
+
+resubmit:
 
 	rc = usb_submit_urb(urb, GFP_ATOMIC);
 	if (rc && rc != -EPERM)
@@ -631,13 +842,19 @@ static ssize_t state_read(struct file *f, char __user *ubuf, size_t len, loff_t 
 	if (*pos > 0)
 		return 0;
 
+	static const char * const reboot_status_str[] = {
+		"idle", "in-progress", "success", "warning"
+	};
+	int rs = atomic_read(&wd->reboot_status);
+
 	n = scnprintf(buf, sizeof(buf),
-		"connected=%d\nraw_frames_ok=%lld\nfilter_frames_ok=%lld\nframes_crc_err=%lld\nframes_dropped=%lld\n",
+		"connected=%d\nraw_frames_ok=%lld\nfilter_frames_ok=%lld\nframes_crc_err=%lld\nframes_dropped=%lld\nreboot_status=%s\n",
 		!wd->disconnected,
 		(long long)atomic64_read(&wd->raw_frames_ok),
 		(long long)atomic64_read(&wd->filter_frames_ok),
 		(long long)atomic64_read(&wd->frames_crc_err),
-		(long long)atomic64_read(&wd->frames_dropped));
+		(long long)atomic64_read(&wd->frames_dropped),
+		reboot_status_str[rs < 4 ? rs : 0]);
 
 	if (len < (size_t)n)
 		n = len;
@@ -652,6 +869,42 @@ static const struct file_operations state_fops = {
 	.read   = state_read,
 };
 
+/* ---------- Misc device: CTRL ---------- */
+
+static ssize_t ctrl_write(struct file *f, const char __user *ubuf,
+			  size_t len, loff_t *pos)
+{
+	struct wheeltec_dev *wd = to_wdev_ctrl(f);
+	char cmd[32];
+	size_t copy_len;
+
+	if (wd->disconnected)
+		return -ENODEV;
+
+	copy_len = min(len, sizeof(cmd) - 1);
+	if (copy_from_user(cmd, ubuf, copy_len))
+		return -EFAULT;
+	cmd[copy_len] = '\0';
+
+	/* Strip trailing newline from shell echo */
+	copy_len = strcspn(cmd, "\r\n");
+	cmd[copy_len] = '\0';
+
+	if (!strcmp(cmd, "freboot")) {
+		if (atomic_cmpxchg(&wd->reboot_pending, 0, 1) != 0)
+			return -EBUSY;
+		schedule_work(&wd->reboot_work);
+		return len;
+	}
+
+	return -EINVAL;
+}
+
+static const struct file_operations ctrl_fops = {
+	.owner  = THIS_MODULE,
+	.write  = ctrl_write,
+};
+
 /* ---------- USB probe / disconnect ---------- */
 
 static int wheeltec_register_misc(struct wheeltec_dev *wd)
@@ -661,6 +914,7 @@ static int wheeltec_register_misc(struct wheeltec_dev *wd)
 	snprintf(wd->name_raw,    sizeof(wd->name_raw),    "wheeltec_imu%d_raw",    wd->id);
 	snprintf(wd->name_filter, sizeof(wd->name_filter), "wheeltec_imu%d_filter", wd->id);
 	snprintf(wd->name_state,  sizeof(wd->name_state),  "wheeltec_imu%d_state",  wd->id);
+	snprintf(wd->name_ctrl,   sizeof(wd->name_ctrl),   "wheeltec_imu%d_ctrl",   wd->id);
 
 	wd->mdev_raw.minor  = MISC_DYNAMIC_MINOR;
 	wd->mdev_raw.name   = wd->name_raw;
@@ -677,6 +931,11 @@ static int wheeltec_register_misc(struct wheeltec_dev *wd)
 	wd->mdev_state.fops   = &state_fops;
 	wd->mdev_state.parent = &wd->intf->dev;
 
+	wd->mdev_ctrl.minor  = MISC_DYNAMIC_MINOR;
+	wd->mdev_ctrl.name   = wd->name_ctrl;
+	wd->mdev_ctrl.fops   = &ctrl_fops;
+	wd->mdev_ctrl.parent = &wd->intf->dev;
+
 	rc = misc_register(&wd->mdev_raw);
 	if (rc)
 		return rc;
@@ -686,8 +945,13 @@ static int wheeltec_register_misc(struct wheeltec_dev *wd)
 	rc = misc_register(&wd->mdev_state);
 	if (rc)
 		goto err_state;
+	rc = misc_register(&wd->mdev_ctrl);
+	if (rc)
+		goto err_ctrl;
 	return 0;
 
+err_ctrl:
+	misc_deregister(&wd->mdev_state);
 err_state:
 	misc_deregister(&wd->mdev_filter);
 err_filter:
@@ -697,6 +961,7 @@ err_filter:
 
 static void wheeltec_unregister_misc(struct wheeltec_dev *wd)
 {
+	misc_deregister(&wd->mdev_ctrl);
 	misc_deregister(&wd->mdev_state);
 	misc_deregister(&wd->mdev_filter);
 	misc_deregister(&wd->mdev_raw);
@@ -706,14 +971,14 @@ static int wheeltec_probe(struct usb_interface *intf,
 			  const struct usb_device_id *id)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
-	struct usb_endpoint_descriptor *bulk_in;
+	struct usb_endpoint_descriptor *bulk_in, *bulk_out;
 	struct wheeltec_dev *wd;
 	int rc;
 
 	rc = usb_find_common_endpoints(intf->cur_altsetting,
-				       &bulk_in, NULL, NULL, NULL);
+				       &bulk_in, &bulk_out, NULL, NULL);
 	if (rc) {
-		dev_err(&intf->dev, "no bulk-in endpoint\n");
+		dev_err(&intf->dev, "no bulk-in/out endpoints\n");
 		return rc;
 	}
 
@@ -734,12 +999,16 @@ static int wheeltec_probe(struct usb_interface *intf,
 	atomic_set(&wd->has_raw,    0);
 	atomic_set(&wd->has_filter, 0);
 	atomic_set(&wd->urb_err_cnt, 0);
+	atomic_set(&wd->reboot_pending, 0);
+	atomic_set(&wd->reboot_status,  0);
 	INIT_WORK(&wd->urb_retry_work, urb_retry_work_fn);
+	INIT_WORK(&wd->reboot_work, wt_reboot_work_fn);
 
 	wd->udev = usb_get_dev(udev);
 	wd->intf = intf;
-	wd->bulk_in_addr = bulk_in->bEndpointAddress;
-	wd->bulk_in_size = usb_endpoint_maxp(bulk_in);
+	wd->bulk_in_addr  = bulk_in->bEndpointAddress;
+	wd->bulk_out_addr = bulk_out->bEndpointAddress;
+	wd->bulk_in_size  = usb_endpoint_maxp(bulk_in);
 	if (wd->bulk_in_size < 64)
 		wd->bulk_in_size = 64;
 
@@ -810,6 +1079,7 @@ static void wheeltec_disconnect(struct usb_interface *intf)
 
 	usb_kill_urb(wd->bulk_in_urb);
 	cancel_work_sync(&wd->urb_retry_work);
+	cancel_work_sync(&wd->reboot_work);
 
 	wheeltec_unregister_misc(wd);
 
@@ -832,6 +1102,7 @@ static int wheeltec_pre_reset(struct usb_interface *intf)
 
 	usb_kill_urb(wd->bulk_in_urb);
 	cancel_work_sync(&wd->urb_retry_work);
+	cancel_work_sync(&wd->reboot_work);
 	return 0;
 }
 
