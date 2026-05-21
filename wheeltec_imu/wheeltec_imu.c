@@ -206,6 +206,20 @@ struct wheeltec_dev {
 	atomic_t		reboot_pending;
 	/* 0=idle, 1=in-progress, 2=success, 3=warning(no stream) */
 	atomic_t		reboot_status;
+	/* Set while waiting for ASCII response after #fconfig */
+	atomic_t		fconfig_pending;
+
+	/* Firmware tare (runs in system_wq to allow msleep) */
+	struct work_struct	tare_work;
+	atomic_t		tare_pending;
+	/* 0=idle, 1=in-progress, 2=success, 3=warning(no stream) */
+	atomic_t		tare_status;
+	/* tare type: 0=gyro, 1=accel, 2=level */
+	int			tare_type;
+	/* calibration wait time in ms (userspace-supplied) */
+	int			tare_wait_ms;
+	/* Set during entire tare command sequence to log all IMU responses */
+	atomic_t		tare_cmd_pending;
 
 	struct kref		kref;
 	struct mutex		io_mutex;
@@ -281,8 +295,7 @@ static int wt_bulk_write(struct wheeltec_dev *wd, const void *buf, size_t len)
  */
 static void wt_reboot_work_fn(struct work_struct *work)
 {
-	struct wheeltec_dev *wd =
-		container_of(work, struct wheeltec_dev, reboot_work);
+	struct wheeltec_dev *wd = container_of(work, struct wheeltec_dev, reboot_work);
 	u64 frames_before;
 	int i;
 
@@ -310,9 +323,11 @@ static void wt_reboot_work_fn(struct work_struct *work)
 	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_ENABLE);
 	msleep(50);
 
-	// dev_info(&wd->intf->dev, "freboot: sending #fconfig\n");
+	dev_info(&wd->intf->dev, "freboot: sending #fconfig\n");
+	// atomic_set(&wd->fconfig_pending, 1);
 	// wt_bulk_write(wd, "#fconfig\r\n", 10);
 	// msleep(800);
+	// atomic_set(&wd->fconfig_pending, 0);
 	// cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
 
 	if (wd->disconnected)
@@ -376,46 +391,158 @@ static void wt_reboot_work_fn(struct work_struct *work)
 	 */
 	dev_info(&wd->intf->dev, "freboot: device still connected, re-setting up UART\n");
 
-	mutex_lock(&wd->io_mutex);
-	wd->fbuf_len = 0;
-	mutex_unlock(&wd->io_mutex);
-	atomic_set(&wd->urb_err_cnt, 0);
-	cp210x_setup(wd->udev, default_baud);
-	msleep(2000); /* let IMU settle and start streaming */
+	usb_kill_urb(wd->bulk_in_urb);
 
 	mutex_lock(&wd->io_mutex);
 	wd->fbuf_len = 0;
 	mutex_unlock(&wd->io_mutex);
+	atomic_set(&wd->has_raw,    0);
+	atomic_set(&wd->has_filter, 0);
+	atomic_set(&wd->urb_err_cnt, 0);
+	cp210x_setup(wd->udev, default_baud);
 
 	if (wd->disconnected)
 		goto aborted;
 
-	{
-		u64 frames_now = atomic64_read(&wd->raw_frames_ok)
-			       + atomic64_read(&wd->filter_frames_ok);
-		int new_frames = (int)min_t(u64, frames_now - frames_before, INT_MAX);
+	if (usb_submit_urb(wd->bulk_in_urb, GFP_KERNEL)) {
+		dev_err(&wd->intf->dev, "freboot: URB resubmit failed\n");
+		atomic_set(&wd->reboot_status, 3);
+		atomic_set(&wd->reboot_pending, 0);
+		return;
+	}
 
-		dev_info(&wd->intf->dev,
-			 "freboot: verify — new_frames=%d (before=%llu now=%llu)\n",
-			 new_frames, frames_before, frames_now);
-
-		if (new_frames >= 5) {
-			dev_info(&wd->intf->dev,
-				 "freboot: SUCCESS — %d frames detected\n", new_frames);
+	for (i = 0; i < 30; i++) {
+		msleep(1000);
+		if (atomic_read(&wd->has_raw)) {
+			dev_info(&wd->intf->dev, "freboot: SUCCESS — stream restored\n");
 			atomic_set(&wd->reboot_status, 2);
-		} else {
-			dev_warn(&wd->intf->dev,
-				 "freboot: WARNING — only %d frames after reboot\n", new_frames);
-			atomic_set(&wd->reboot_status, 3);
+			atomic_set(&wd->reboot_pending, 0);
+			return;
 		}
 	}
+	dev_warn(&wd->intf->dev, "freboot: WARNING — stream not restored after 30s\n");
+	atomic_set(&wd->reboot_status, 3);
 	atomic_set(&wd->reboot_pending, 0);
 	return;
 
 	aborted:
-		dev_info(&wd->intf->dev, "freboot: aborted (disconnected before command sequence completed)\n");
+		dev_info(&wd->intf->dev, "freboot: aborted (disconnected mid-sequence)\n");
 		atomic_set(&wd->reboot_status, 0);
 		atomic_set(&wd->reboot_pending, 0);
+}
+
+/* ---------- Tare sequence (workqueue context) ---------- */
+
+/*
+ * Sequence mirrors RobotNet12 ImuControl.TareAsync():
+ *
+ *  1. disable UART → purge → flush → enable UART
+ *  2. #fconfig      → 800ms  → purge
+ *  3. #fimucal_*    → wait_ms (user-supplied, default 2500ms)
+ *  4. #fsave        → 800ms
+ *  5. #fconfig      → 800ms  → purge
+ *  6. #freboot      → 1500ms → purge
+ *  7. y             → 800ms
+ *  8. chờ USB disconnect/reconnect (probe tự handle)
+ *     hoặc nếu không disconnect: re-setup CP2102 → verify stream
+ */
+
+/*
+ * usb_reset_device() must NOT be called from a work item that holds
+ * any USB lock — schedule it on a dedicated work item instead.
+ */
+static void wt_tare_work_fn(struct work_struct *work)
+{
+	struct wheeltec_dev *wd =
+		container_of(work, struct wheeltec_dev, tare_work);
+	u64 frames_before;
+	int i;
+	const char *cal_cmd;
+
+	atomic_set(&wd->tare_status, 1); /* in-progress */
+	atomic_set(&wd->tare_cmd_pending, 1); /* log all IMU responses */
+
+	if (wd->disconnected)
+		goto aborted;
+
+	switch (wd->tare_type) {
+	case 0: cal_cmd = "#fimucal_gyro\r\n";  break;
+	case 1: cal_cmd = "#fimucal_acce\r\n";  break;
+	case 2: cal_cmd = "#fimucal_level\r\n"; break;
+	default:
+		dev_err(&wd->intf->dev, "tare: unknown type %d\n", wd->tare_type);
+		goto aborted;
+	}
+
+	/* Dừng stream giống reboot sequence — disable UART, purge, flush, enable lại */
+	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_DISABLE);
+	msleep(100);
+	cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
+	msleep(50);
+	mutex_lock(&wd->io_mutex);
+	wd->fbuf_len = 0;
+	mutex_unlock(&wd->io_mutex);
+	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_ENABLE);
+	msleep(50);
+
+	frames_before = atomic64_read(&wd->raw_frames_ok)
+		      + atomic64_read(&wd->filter_frames_ok);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	dev_info(&wd->intf->dev, "tare: sending #fconfig\n");
+	wt_bulk_write(wd, "#fconfig\r\n", 10);
+	msleep(800);
+	cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	dev_info(&wd->intf->dev, "tare: sending %s (wait %dms)\n",
+		 cal_cmd, wd->tare_wait_ms);
+	wt_bulk_write(wd, cal_cmd, strlen(cal_cmd));
+	for (i = 0; i < wd->tare_wait_ms / 100 && !wd->disconnected; i++)
+		msleep(100);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	dev_info(&wd->intf->dev, "tare: sending #fsave\n");
+	wt_bulk_write(wd, "#fsave\r\n", 8);
+	msleep(800);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	/* #freboot gửi thẳng từ config mode, y sau 300ms — theo protocol N100 */
+	dev_info(&wd->intf->dev, "tare: sending #freboot\n");
+	wt_bulk_write(wd, "#freboot\r\n", 10);
+	msleep(300);
+
+	if (wd->disconnected)
+		goto aborted;
+
+	dev_info(&wd->intf->dev, "tare: sending y\n");
+	wt_bulk_write(wd, "y\r\n", 3);
+	msleep(300);
+
+	/*
+	 * IMU requires physical unplug/replug to resume streaming after reboot.
+	 * Python code mirrors this by closing the serial port and not reopening.
+	 * We declare SUCCESS here — userspace must replug USB to get data again.
+	 */
+	dev_info(&wd->intf->dev, "tare: SUCCESS — replug USB to resume stream\n");
+	atomic_set(&wd->tare_cmd_pending, 0);
+	atomic_set(&wd->tare_status, 2);
+	atomic_set(&wd->tare_pending, 0);
+	return;
+
+	aborted:
+		dev_info(&wd->intf->dev, "tare: aborted (disconnected)\n");
+		atomic_set(&wd->tare_cmd_pending, 0);
+		atomic_set(&wd->tare_status, 0);
+		atomic_set(&wd->tare_pending, 0);
 }
 
 /* ---------- CP210x init helpers ---------- */
@@ -683,12 +810,18 @@ static void wheeltec_read_complete(struct urb *urb)
 		size_t copy_len  = urb->actual_length;
 		size_t free_space = FRAME_BUF_SIZE - wd->fbuf_len;
 
-		/* Khi đang reboot: dump bytes ra dmesg để debug,
-		 * bỏ qua parse_buffer (data là ASCII response, không phải FDILink) */
-		if (atomic_read(&wd->reboot_pending)) {
+		/* Dump ASCII bytes ra dmesg khi đang chờ response lệnh */
+		if (atomic_read(&wd->fconfig_pending) || atomic_read(&wd->reboot_pending) ||
+		    atomic_read(&wd->tare_cmd_pending)) {
 			u8 *buf = urb->transfer_buffer;
 			size_t len = urb->actual_length;
-			/* In printable ASCII, thay non-printable bằng '.' */
+			const char *prefix;
+			if (atomic_read(&wd->tare_cmd_pending))
+				prefix = "tare rx";
+			else if (atomic_read(&wd->fconfig_pending))
+				prefix = "fconfig rx";
+			else
+				prefix = "freboot rx";
 			char tmp[65];
 			size_t i, chunk;
 			for (i = 0; i < len; i += 64) {
@@ -697,9 +830,11 @@ static void wheeltec_read_complete(struct urb *urb)
 				for (j = 0; j < chunk; j++)
 					tmp[j] = (buf[i+j] >= 32 && buf[i+j] < 127) ? buf[i+j] : '.';
 				tmp[chunk] = '\0';
-				dev_info(&wd->intf->dev, "freboot rx: [%s]\n", tmp);
+				dev_info(&wd->intf->dev, "%s: [%s]\n", prefix, tmp);
 			}
-			goto resubmit;
+			/* tare: vẫn parse để detect khi stream binary quay lại */
+			if (!atomic_read(&wd->tare_cmd_pending))
+				goto resubmit;
 		}
 
 		if (copy_len > free_space) {
@@ -847,14 +982,17 @@ static ssize_t state_read(struct file *f, char __user *ubuf, size_t len, loff_t 
 	};
 	int rs = atomic_read(&wd->reboot_status);
 
+	int ts = atomic_read(&wd->tare_status);
+
 	n = scnprintf(buf, sizeof(buf),
-		"connected=%d\nraw_frames_ok=%lld\nfilter_frames_ok=%lld\nframes_crc_err=%lld\nframes_dropped=%lld\nreboot_status=%s\n",
+		"connected=%d\nraw_frames_ok=%lld\nfilter_frames_ok=%lld\nframes_crc_err=%lld\nframes_dropped=%lld\nreboot_status=%s\ntare_status=%s\n",
 		!wd->disconnected,
 		(long long)atomic64_read(&wd->raw_frames_ok),
 		(long long)atomic64_read(&wd->filter_frames_ok),
 		(long long)atomic64_read(&wd->frames_crc_err),
 		(long long)atomic64_read(&wd->frames_dropped),
-		reboot_status_str[rs < 4 ? rs : 0]);
+		reboot_status_str[rs < 4 ? rs : 0],
+		reboot_status_str[ts < 4 ? ts : 0]);
 
 	if (len < (size_t)n)
 		n = len;
@@ -894,6 +1032,39 @@ static ssize_t ctrl_write(struct file *f, const char __user *ubuf,
 		if (atomic_cmpxchg(&wd->reboot_pending, 0, 1) != 0)
 			return -EBUSY;
 		schedule_work(&wd->reboot_work);
+		return len;
+	}
+
+	/*
+	 * tare:<type>:<wait_ms>
+	 *   type    : gyro | accel | level
+	 *   wait_ms : thời gian chờ calibration (ms), ví dụ 2500
+	 *
+	 * Ví dụ: "tare:gyro:2500"
+	 *        "tare:level:5000"
+	 */
+	if (!strncmp(cmd, "tare:", 5)) {
+		char type_str[16];
+		int wait_ms = 2500;
+		int tare_type;
+
+		if (sscanf(cmd + 5, "%15[^:]:%d", type_str, &wait_ms) < 1)
+			return -EINVAL;
+
+		if (!strcmp(type_str, "gyro"))       tare_type = 0;
+		else if (!strcmp(type_str, "accel")) tare_type = 1;
+		else if (!strcmp(type_str, "level")) tare_type = 2;
+		else return -EINVAL;
+
+		if (wait_ms < 100 || wait_ms > 60000)
+			return -EINVAL;
+
+		if (atomic_cmpxchg(&wd->tare_pending, 0, 1) != 0)
+			return -EBUSY;
+
+		wd->tare_type    = tare_type;
+		wd->tare_wait_ms = wait_ms;
+		schedule_work(&wd->tare_work);
 		return len;
 	}
 
@@ -999,10 +1170,17 @@ static int wheeltec_probe(struct usb_interface *intf,
 	atomic_set(&wd->has_raw,    0);
 	atomic_set(&wd->has_filter, 0);
 	atomic_set(&wd->urb_err_cnt, 0);
-	atomic_set(&wd->reboot_pending, 0);
-	atomic_set(&wd->reboot_status,  0);
+	atomic_set(&wd->reboot_pending,  0);
+	atomic_set(&wd->reboot_status,   0);
+	atomic_set(&wd->fconfig_pending, 0);
+	atomic_set(&wd->tare_pending,    0);
+	atomic_set(&wd->tare_cmd_pending, 0);
+	atomic_set(&wd->tare_status,    0);
+	wd->tare_type    = 0;
+	wd->tare_wait_ms = 2500;
 	INIT_WORK(&wd->urb_retry_work, urb_retry_work_fn);
 	INIT_WORK(&wd->reboot_work, wt_reboot_work_fn);
+	INIT_WORK(&wd->tare_work, wt_tare_work_fn);
 
 	wd->udev = usb_get_dev(udev);
 	wd->intf = intf;
@@ -1080,6 +1258,7 @@ static void wheeltec_disconnect(struct usb_interface *intf)
 	usb_kill_urb(wd->bulk_in_urb);
 	cancel_work_sync(&wd->urb_retry_work);
 	cancel_work_sync(&wd->reboot_work);
+	cancel_work_sync(&wd->tare_work);
 
 	wheeltec_unregister_misc(wd);
 
@@ -1103,6 +1282,7 @@ static int wheeltec_pre_reset(struct usb_interface *intf)
 	usb_kill_urb(wd->bulk_in_urb);
 	cancel_work_sync(&wd->urb_retry_work);
 	cancel_work_sync(&wd->reboot_work);
+	cancel_work_sync(&wd->tare_work);
 	return 0;
 }
 

@@ -94,6 +94,7 @@ depmod -a
 ## Bước 4 — Load module
 
 ```bash
+sudo modprobe -r wheeltec_imu_mod
 sudo modprobe wheeltec_imu_mod
 ```
 
@@ -112,7 +113,8 @@ Device node xuất hiện:
 ```bash
 ls /dev/wheeltec_imu*
 # /dev/wheeltec_imu0_ctrl
-# /dev/wheeltec_imu0_data
+# /dev/wheeltec_imu0_raw
+#/dev/wheeltec_imu0-filter
 # /dev/wheeltec_imu0_state
 ```
 
@@ -172,6 +174,38 @@ echo "wheeltec_imu_mod" | sudo tee /etc/modules-load.d/wheeltec.conf
 ```bash
 sudo modprobe -r wheeltec_imu_mod
 ```
+
+---
+
+## Reboot IMU (reset mà không unplug)
+
+### Build
+
+```bash
+gcc -O2 -Wall -o imu_reboot imu_reboot.c
+```
+
+### Dùng
+
+**Cách 1 — USB reset** (nhanh ~1s, driver tự re-probe):
+
+```bash
+sudo ./imu_reboot --usb-reset
+```
+
+**Cách 2 — Module cycle** (rmmod + modprobe, đầy đủ ~3s):
+
+```bash
+sudo ./imu_reboot --module-cycle
+```
+
+Đổi baud khi load lại:
+
+```bash
+sudo ./imu_reboot --module-cycle --baud 115200
+```
+
+Sau khi reboot thành công, chương trình in ra nội dung `/dev/wheeltec_imu0_state`.
 
 ---
 
