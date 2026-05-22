@@ -66,8 +66,10 @@ still enumerates as a USB device (just without a tty or wheeltec_imu attached).
 `cp210x-cfg` can talk to it as long as the host can see USB descriptors:
 
 ```bash
-sudo cp210x-cfg -V 0x10c4 -P 0xea60 -m "Silicon Labs" \
-    -p "CP2102 USB to UART Bridge Controller" -s "0001"
+sudo cp210x-cfg -m 10c4:e100 -V 0x10c4 -P 0xea60 \
+    -N "CP2102 USB to UART Bridge Controller" \
+    -S "0001"
+
 ```
 
 ## OTP warning
