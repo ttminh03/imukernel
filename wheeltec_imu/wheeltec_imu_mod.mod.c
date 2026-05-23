@@ -49,7 +49,6 @@ __used __section("__versions") = {
 	{ 0x76a26ca1, "usb_bulk_msg" },
 	{ 0xd272d446, "__stack_chk_fail" },
 	{ 0xf64ac983, "__copy_overflow" },
-	{ 0x9479a1e8, "strnlen" },
 	{ 0xa9289d30, "usb_get_dev" },
 	{ 0x0819dba7, "usb_submit_urb" },
 	{ 0x9878df8a, "_dev_info" },
@@ -57,13 +56,11 @@ __used __section("__versions") = {
 	{ 0x7a5ffe84, "init_wait_entry" },
 	{ 0x9878df8a, "_dev_err" },
 	{ 0xbd03ed67, "random_kmalloc_seed" },
-	{ 0xf46d5bf3, "mutex_lock" },
 	{ 0x837202b8, "usb_control_msg" },
 	{ 0x4c3d335e, "ida_free" },
 	{ 0x173ec8da, "sscanf" },
 	{ 0xc1e6c71e, "__mutex_init" },
 	{ 0xef4e4365, "usb_deregister" },
-	{ 0xe54e0a6b, "__fortify_panic" },
 	{ 0x9878df8a, "_dev_warn" },
 	{ 0xd33d3223, "misc_register" },
 	{ 0xd272d446, "__x86_return_thunk" },
@@ -71,7 +68,6 @@ __used __section("__versions") = {
 	{ 0x092a35a2, "_copy_to_user" },
 	{ 0x5403c125, "__init_waitqueue_head" },
 	{ 0x6514c3b7, "strcspn" },
-	{ 0xf46d5bf3, "mutex_unlock" },
 	{ 0x70db3fe4, "__kmalloc_cache_noprof" },
 	{ 0xd6d46b9d, "usb_kill_urb" },
 	{ 0x2d88a3ab, "cancel_work_sync" },
@@ -114,7 +110,6 @@ __used __section("__version_ext_crcs") = {
 	0x76a26ca1,
 	0xd272d446,
 	0xf64ac983,
-	0x9479a1e8,
 	0xa9289d30,
 	0x0819dba7,
 	0x9878df8a,
@@ -122,13 +117,11 @@ __used __section("__version_ext_crcs") = {
 	0x7a5ffe84,
 	0x9878df8a,
 	0xbd03ed67,
-	0xf46d5bf3,
 	0x837202b8,
 	0x4c3d335e,
 	0x173ec8da,
 	0xc1e6c71e,
 	0xef4e4365,
-	0xe54e0a6b,
 	0x9878df8a,
 	0xd33d3223,
 	0xd272d446,
@@ -136,7 +129,6 @@ __used __section("__version_ext_crcs") = {
 	0x092a35a2,
 	0x5403c125,
 	0x6514c3b7,
-	0xf46d5bf3,
 	0x70db3fe4,
 	0xd6d46b9d,
 	0x2d88a3ab,
@@ -178,7 +170,6 @@ __used __section("__version_ext_names") =
 	"usb_bulk_msg\0"
 	"__stack_chk_fail\0"
 	"__copy_overflow\0"
-	"strnlen\0"
 	"usb_get_dev\0"
 	"usb_submit_urb\0"
 	"_dev_info\0"
@@ -186,13 +177,11 @@ __used __section("__version_ext_names") =
 	"init_wait_entry\0"
 	"_dev_err\0"
 	"random_kmalloc_seed\0"
-	"mutex_lock\0"
 	"usb_control_msg\0"
 	"ida_free\0"
 	"sscanf\0"
 	"__mutex_init\0"
 	"usb_deregister\0"
-	"__fortify_panic\0"
 	"_dev_warn\0"
 	"misc_register\0"
 	"__x86_return_thunk\0"
@@ -200,7 +189,6 @@ __used __section("__version_ext_names") =
 	"_copy_to_user\0"
 	"__init_waitqueue_head\0"
 	"strcspn\0"
-	"mutex_unlock\0"
 	"__kmalloc_cache_noprof\0"
 	"usb_kill_urb\0"
 	"cancel_work_sync\0"
@@ -218,4 +206,4 @@ MODULE_INFO(depends, "");
 
 MODULE_ALIAS("usb:v10C4pE100d*dc*dsc*dp*ic*isc*ip*in*");
 
-MODULE_INFO(srcversion, "6C27C53F07C1B70B00C090E");
+MODULE_INFO(srcversion, "15FB137B43353AB177010EC");
