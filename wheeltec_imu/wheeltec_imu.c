@@ -282,151 +282,137 @@ static int wt_bulk_write(struct wheeltec_dev *wd, const void *buf, size_t len)
 /* ---------- Firmware reboot sequence (workqueue context) ---------- */
 
 /*
- * Mirrors RobotNet12 ImuControl.RebootAsync():
+ * Mirrors ImuControl.RebootAsync() from C# (confirmed working):
  *
- *  1. #fconfig  → 800ms  → purge RX
- *  2. #freboot  → 1500ms → purge RX
- *  3. y         → 800ms
- *  4. Invalidate snapshots + reset EMA state (readers will block)
- *  5. Flush parser buffer
- *  6. Wait 15s for firmware to boot
- *  7. Verify: count 0xFC frame-heads arriving in next 12s
- *     ≥5 heads → SUCCESS, else WARNING
+ *  Send("#fconfig")  → SendOn delay 300ms → await Delay(800ms)  → DiscardInBuffer
+ *  Send("#freboot")  → SendOn delay 300ms → await Delay(1500ms) → DiscardInBuffer
+ *  Send("y")         → SendOn delay 300ms → await Delay(800ms)
+ *  _port.Close()
+ *  await Delay(15s)
+ *  OpenFreshPort (retry loop) → CountFrameHeads 12s
+ *
+ * Key insight: IMU reboots → USB disconnect → wheeltec_disconnect() fires →
+ * wheeltec_probe() runs automatically and restores stream. reboot_work only
+ * needs to send the commands then wait for disconnect. If disconnect happens,
+ * probe handles everything — we just exit. If no disconnect after 20s, do
+ * manual UART reinit as fallback.
  */
 static void wt_reboot_work_fn(struct work_struct *work)
 {
 	struct wheeltec_dev *wd = container_of(work, struct wheeltec_dev, reboot_work);
-	u64 frames_before;
-	int i;
+	u64 frames_before, frames_after;
+	int i, rc;
 
-	atomic_set(&wd->reboot_status, 1); /* in-progress */
+	atomic_set(&wd->reboot_status, 1);
 
 	if (wd->disconnected)
 		goto aborted;
 
-	frames_before = atomic64_read(&wd->raw_frames_ok)
-		      + atomic64_read(&wd->filter_frames_ok);
-
-	/*
-	 * IMU đang stream binary 400Hz liên tục — UART RX của CP2102 bận.
-	 * Disable UART trước để buffer sạch, gửi lệnh xong rồi enable lại.
-	 * Nếu không làm bước này, lệnh ASCII bị lẫn vào giữa binary stream,
-	 * IMU không nhận ra và tiếp tục stream — không vào config mode.
-	 */
+	/* Stop binary stream before sending ASCII commands */
+	usb_kill_urb(wd->bulk_in_urb);
 	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_DISABLE);
 	msleep(100);
 	cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
 	msleep(50);
-	mutex_lock(&wd->io_mutex);
 	wd->fbuf_len = 0;
-	mutex_unlock(&wd->io_mutex);
 	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_ENABLE);
 	msleep(50);
 
-	dev_info(&wd->intf->dev, "freboot: sending #fconfig\n");
-	// atomic_set(&wd->fconfig_pending, 1);
-	// wt_bulk_write(wd, "#fconfig\r\n", 10);
-	// msleep(800);
-	// atomic_set(&wd->fconfig_pending, 0);
-	// cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
+	/* Send("#fconfig") → 300ms internal + 800ms delay → DiscardInBuffer */
+	dev_info(&wd->intf->dev, "TX >> #fconfig\n");
+	atomic_set(&wd->fconfig_pending, 1);
+	rc = usb_submit_urb(wd->bulk_in_urb, GFP_KERNEL);
+	if (rc && rc != -EPERM && !wd->disconnected)
+		dev_warn(&wd->intf->dev, "freboot: URB submit rc=%d\n", rc);
+	wt_bulk_write(wd, "#fconfig\r\n", 10);
+	msleep(300 + 800); /* SendOn(300) + Delay(800) */
+	atomic_set(&wd->fconfig_pending, 0);
+	usb_kill_urb(wd->bulk_in_urb);
+	cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
+	wd->fbuf_len = 0;
 
 	if (wd->disconnected)
 		goto aborted;
 
-	dev_info(&wd->intf->dev, "freboot: sending #freboot\n");
+	/* Send("#freboot") → 300ms internal + 1500ms delay → DiscardInBuffer */
+	dev_info(&wd->intf->dev, "TX >> #freboot\n");
 	wt_bulk_write(wd, "#freboot\r\n", 10);
-	msleep(1500);
+	msleep(300 + 1500); /* SendOn(300) + Delay(1500) */
 	cp210x_ctrl_out(wd->udev, CP210X_PURGE, PURGE_ALL);
 
 	if (wd->disconnected)
 		goto aborted;
 
-	dev_info(&wd->intf->dev, "freboot: sending y\n");
+	/* Send("y") → 300ms internal + 800ms delay */
+	dev_info(&wd->intf->dev, "TX >> y\n");
 	wt_bulk_write(wd, "y\r\n", 3);
+	msleep(300 + 800); /* SendOn(300) + Delay(800) */
+
+	/* _port.Close() → disable UART */
+	cp210x_ctrl_out(wd->udev, CP210X_IFC_ENABLE, UART_DISABLE);
 
 	/*
-	 * After "y", the CP2102 firmware reboots — USB disconnect follows.
-	 * Two possible outcomes:
-	 *
-	 * A) USB disconnect happens → wheeltec_disconnect sets disconnected=true
-	 *    → our 15s loop exits early → wheeltec_probe re-runs on reconnect
-	 *    → new wd is created, streams normally.  We set SUCCESS here.
-	 *
-	 * B) Only UART resets (no USB disconnect) → disconnected stays false
-	 *    → we wait 15s, re-setup CP2102, verify frames ourselves.
+	 * await Delay(15s): IMU reboots, USB disconnects, wheeltec_disconnect()
+	 * fires → wd->disconnected = true. If that happens, probe() will
+	 * re-bind automatically and restore the stream — we just exit.
 	 */
-	msleep(800); /* give device time to start rebooting */
-
-	/* Invalidate stale snapshots */
-	atomic_set(&wd->has_raw,    0);
-	atomic_set(&wd->has_filter, 0);
-	write_seqcount_begin(&wd->raw_seq);
-	wd->raw_snap.hz = 0;
-	write_seqcount_end(&wd->raw_seq);
-	write_seqcount_begin(&wd->filter_seq);
-	wd->filter_snap.hz = 0;
-	write_seqcount_end(&wd->filter_seq);
-	wd->raw_last_hw_ts    = 0; wd->raw_period_avg    = 0;
-	wd->filter_last_hw_ts = 0; wd->filter_period_avg = 0;
-	mutex_lock(&wd->io_mutex);
-	wd->fbuf_len = 0;
-	mutex_unlock(&wd->io_mutex);
-
-	dev_info(&wd->intf->dev, "freboot: waiting up to 15s for device to reboot...\n");
-	for (i = 0; i < 15; i++) {
-		msleep(1000);
-		/* Scenario A: USB disconnect happened → new probe will handle it */
+	dev_info(&wd->intf->dev, "freboot: waiting up to 20s for USB disconnect/reconnect...\n");
+	for (i = 0; i < 200; i++) {
+		msleep(100);
 		if (wd->disconnected) {
-			dev_info(&wd->intf->dev,
-				 "freboot: USB disconnect detected — reboot in progress, new probe will reconnect\n");
-			atomic_set(&wd->reboot_status, 2); /* SUCCESS via USB reconnect */
-			atomic_set(&wd->reboot_pending, 0);
-			return;
-		}
-	}
-
-	/*
-	 * Scenario B: still connected after 15s — CP2102 did not USB-disconnect.
-	 * Re-setup UART and verify the stream resumed on its own.
-	 */
-	dev_info(&wd->intf->dev, "freboot: device still connected, re-setting up UART\n");
-
-	usb_kill_urb(wd->bulk_in_urb);
-
-	mutex_lock(&wd->io_mutex);
-	wd->fbuf_len = 0;
-	mutex_unlock(&wd->io_mutex);
-	atomic_set(&wd->has_raw,    0);
-	atomic_set(&wd->has_filter, 0);
-	atomic_set(&wd->urb_err_cnt, 0);
-	cp210x_setup(wd->udev, default_baud);
-
-	if (wd->disconnected)
-		goto aborted;
-
-	if (usb_submit_urb(wd->bulk_in_urb, GFP_KERNEL)) {
-		dev_err(&wd->intf->dev, "freboot: URB resubmit failed\n");
-		atomic_set(&wd->reboot_status, 3);
-		atomic_set(&wd->reboot_pending, 0);
-		return;
-	}
-
-	for (i = 0; i < 30; i++) {
-		msleep(1000);
-		if (atomic_read(&wd->has_raw)) {
-			dev_info(&wd->intf->dev, "freboot: SUCCESS — stream restored\n");
+			dev_info(&wd->intf->dev, "freboot: USB disconnect detected — probe will restore stream\n");
 			atomic_set(&wd->reboot_status, 2);
 			atomic_set(&wd->reboot_pending, 0);
 			return;
 		}
 	}
-	dev_warn(&wd->intf->dev, "freboot: WARNING — stream not restored after 30s\n");
-	atomic_set(&wd->reboot_status, 3);
+
+	/*
+	 * No USB disconnect after 20s — IMU stayed connected (some firmware
+	 * variants don't USB-disconnect on reboot). Do manual UART reinit
+	 * as fallback (= OpenFreshPort in C#).
+	 */
+	dev_info(&wd->intf->dev, "freboot: no disconnect — manual UART reinit\n");
+	rc = cp210x_setup(wd->udev, default_baud);
+	if (rc)
+		dev_warn(&wd->intf->dev, "freboot: cp210x_setup failed: %d\n", rc);
+
+	wd->fbuf_len = 0;
+	atomic_set(&wd->urb_err_cnt, 0);
+
+	frames_before = atomic64_read(&wd->raw_frames_ok)
+		      + atomic64_read(&wd->filter_frames_ok);
+
 	atomic_set(&wd->reboot_pending, 0);
+
+	rc = usb_submit_urb(wd->bulk_in_urb, GFP_KERNEL);
+	if (rc && rc != -EPERM && !wd->disconnected) {
+		dev_err(&wd->intf->dev, "freboot: URB submit failed: %d\n", rc);
+		atomic_set(&wd->reboot_status, 3);
+		return;
+	}
+
+	dev_info(&wd->intf->dev, "freboot: polling 12s for stream...\n");
+	for (i = 0; i < 120 && !wd->disconnected; i++) {
+		msleep(100);
+		frames_after = atomic64_read(&wd->raw_frames_ok)
+			     + atomic64_read(&wd->filter_frames_ok);
+		if (frames_after > frames_before + 5) {
+			dev_info(&wd->intf->dev, "freboot: SUCCESS — stream restored\n");
+			atomic_set(&wd->reboot_status, 2);
+			return;
+		}
+	}
+
+	if (wd->disconnected)
+		goto aborted;
+
+	dev_warn(&wd->intf->dev, "freboot: WARNING — no stream after fallback reinit\n");
+	atomic_set(&wd->reboot_status, 3);
 	return;
 
 	aborted:
-		dev_info(&wd->intf->dev, "freboot: aborted (disconnected mid-sequence)\n");
+		dev_info(&wd->intf->dev, "freboot: aborted (disconnected)\n");
 		atomic_set(&wd->reboot_status, 0);
 		atomic_set(&wd->reboot_pending, 0);
 }
@@ -810,28 +796,56 @@ static void wheeltec_read_complete(struct urb *urb)
 		size_t copy_len  = urb->actual_length;
 		size_t free_space = FRAME_BUF_SIZE - wd->fbuf_len;
 
-		/* Dump ASCII bytes ra dmesg khi đang chờ response lệnh */
-		if (atomic_read(&wd->fconfig_pending) || atomic_read(&wd->reboot_pending) ||
-		    atomic_read(&wd->tare_cmd_pending)) {
+		/*
+		 * Log IMU ASCII responses (*#OK, *#ERROR, etc).
+		 * Binary frames có byte 0xFC — nếu buffer bắt đầu bằng 0xFC
+		 * thì đây là binary stream, không log để tránh garbage.
+		 * Chỉ log khi có ký tự '*' hoặc '#' trong buffer (IMU response).
+		 */
+		if (atomic_read(&wd->fconfig_pending) || atomic_read(&wd->tare_cmd_pending)) {
 			u8 *buf = urb->transfer_buffer;
 			size_t len = urb->actual_length;
-			const char *prefix;
-			if (atomic_read(&wd->tare_cmd_pending))
-				prefix = "tare rx";
-			else if (atomic_read(&wd->fconfig_pending))
-				prefix = "fconfig rx";
-			else
-				prefix = "freboot rx";
-			char tmp[65];
-			size_t i, chunk;
-			for (i = 0; i < len; i += 64) {
-				chunk = min(len - i, (size_t)64);
-				size_t j;
-				for (j = 0; j < chunk; j++)
-					tmp[j] = (buf[i+j] >= 32 && buf[i+j] < 127) ? buf[i+j] : '.';
-				tmp[chunk] = '\0';
-				dev_info(&wd->intf->dev, "%s: [%s]\n", prefix, tmp);
+			size_t i;
+			bool has_imu_resp = false;
+
+			/* Kiểm tra buffer có chứa IMU ASCII response không */
+			for (i = 0; i + 1 < len; i++) {
+				if (buf[i] == '*' && buf[i+1] == '#') {
+					has_imu_resp = true;
+					break;
+				}
 			}
+
+			if (has_imu_resp) {
+				char tmp[65];
+				size_t out = 0;
+				for (i = 0; i < len; i++) {
+					u8 b = buf[i];
+					if (b == '\r')
+						continue;
+					if (b == '\n') {
+						if (out > 0) {
+							tmp[out] = '\0';
+							dev_info(&wd->intf->dev, "IMU << %s\n", tmp);
+							out = 0;
+						}
+						continue;
+					}
+					if (b >= 32 && b < 127) {
+						tmp[out++] = b;
+						if (out == 64) {
+							tmp[out] = '\0';
+							dev_info(&wd->intf->dev, "IMU << %s\n", tmp);
+							out = 0;
+						}
+					}
+				}
+				if (out > 0) {
+					tmp[out] = '\0';
+					dev_info(&wd->intf->dev, "IMU << %s\n", tmp);
+				}
+			}
+
 			/* tare: vẫn parse để detect khi stream binary quay lại */
 			if (!atomic_read(&wd->tare_cmd_pending))
 				goto resubmit;
