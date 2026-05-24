@@ -38,6 +38,7 @@ __used __section("__versions") = {
 	{ 0x40a621c5, "scnprintf" },
 	{ 0xa53f4e29, "memcpy" },
 	{ 0xcb8b6ec6, "kfree" },
+	{ 0x0feb1e94, "usleep_range_state" },
 	{ 0x0db8d68d, "prepare_to_wait_event" },
 	{ 0x16ab4215, "__wake_up" },
 	{ 0xd272d446, "__fentry__" },
@@ -70,6 +71,7 @@ __used __section("__versions") = {
 	{ 0x6514c3b7, "strcspn" },
 	{ 0x70db3fe4, "__kmalloc_cache_noprof" },
 	{ 0xd6d46b9d, "usb_kill_urb" },
+	{ 0x97acb853, "ktime_get" },
 	{ 0x2d88a3ab, "cancel_work_sync" },
 	{ 0x75738bed, "__warn_printk" },
 	{ 0xe4de56b4, "__ubsan_handle_load_invalid_value" },
@@ -99,6 +101,7 @@ __used __section("__version_ext_crcs") = {
 	0x40a621c5,
 	0xa53f4e29,
 	0xcb8b6ec6,
+	0x0feb1e94,
 	0x0db8d68d,
 	0x16ab4215,
 	0xd272d446,
@@ -131,6 +134,7 @@ __used __section("__version_ext_crcs") = {
 	0x6514c3b7,
 	0x70db3fe4,
 	0xd6d46b9d,
+	0x97acb853,
 	0x2d88a3ab,
 	0x75738bed,
 	0xe4de56b4,
@@ -159,6 +163,7 @@ __used __section("__version_ext_names") =
 	"scnprintf\0"
 	"memcpy\0"
 	"kfree\0"
+	"usleep_range_state\0"
 	"prepare_to_wait_event\0"
 	"__wake_up\0"
 	"__fentry__\0"
@@ -191,6 +196,7 @@ __used __section("__version_ext_names") =
 	"strcspn\0"
 	"__kmalloc_cache_noprof\0"
 	"usb_kill_urb\0"
+	"ktime_get\0"
 	"cancel_work_sync\0"
 	"__warn_printk\0"
 	"__ubsan_handle_load_invalid_value\0"
@@ -206,4 +212,4 @@ MODULE_INFO(depends, "");
 
 MODULE_ALIAS("usb:v10C4pE100d*dc*dsc*dp*ic*isc*ip*in*");
 
-MODULE_INFO(srcversion, "15FB137B43353AB177010EC");
+MODULE_INFO(srcversion, "C85A3162B4BC523133F39A1");

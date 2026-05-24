@@ -223,6 +223,28 @@ struct wheeltec_dev {
 	/* True after startup gyro-tare has run once — prevents re-tare on reconnect */
 	bool			startup_tare_done;
 
+	/* Manual gyro bias calibration.
+	 * Collect 3s of samples in a workqueue (process context) to avoid
+	 * float/SSE restrictions in softirq. Raw IEEE-754 bits are passed via
+	 * atomic snapshot; soft-float decode (pure integer) computes mean bias.
+	 * bias stored as s32 nrad/s (1e-9 rad/s).
+	 */
+	struct work_struct	calib_work;
+	bool			gyro_calib_collecting;
+	bool			gyro_calib_done;
+	/* Raw float bits of latest gyro sample — written by softirq, read by calib_work */
+	atomic_t		calib_gyro_x_bits;
+	atomic_t		calib_gyro_y_bits;
+	atomic_t		calib_gyro_z_bits;
+	atomic_t		calib_sample_ready; /* new sample available */
+	s64			gyro_sum_x;	/* nrad/s accumulator */
+	s64			gyro_sum_y;
+	s64			gyro_sum_z;
+	u32			gyro_calib_count;
+	s32			gyro_bias_x;	/* nrad/s, subtracted before publish */
+	s32			gyro_bias_y;
+	s32			gyro_bias_z;
+
 	struct kref		kref;
 	struct mutex		io_mutex;
 	bool			disconnected;
@@ -447,6 +469,13 @@ static void wt_tare_work_fn(struct work_struct *work)
 	atomic_set(&wd->tare_status, 1); /* in-progress */
 	atomic_set(&wd->tare_cmd_pending, 1);
 
+	/* Tare changes sensor characteristics — old bias is no longer valid */
+	wd->gyro_calib_done       = false;
+	wd->gyro_calib_collecting = false;
+	wd->gyro_bias_x = 0;
+	wd->gyro_bias_y = 0;
+	wd->gyro_bias_z = 0;
+
 	if (wd->disconnected)
 		goto aborted;
 
@@ -578,6 +607,8 @@ static void wt_tare_work_fn(struct work_struct *work)
 			dev_info(&wd->intf->dev, "tare: SUCCESS — stream restored\n");
 			atomic_set(&wd->tare_cmd_pending, 0);
 			atomic_set(&wd->tare_status, 2);
+			wd->gyro_calib_collecting = true;
+			schedule_work(&wd->calib_work);
 			return;
 		}
 	}
@@ -665,6 +696,158 @@ static u8 expected_payload_len(u8 type)
 	}
 }
 
+
+/* ---------- Soft-float helpers (pure integer, no SSE) ---------- */
+
+/*
+ * Decode IEEE 754 single-precision float bits → nrad/s (s32, 1e-9 rad/s).
+ * Handles normal numbers only; subnormals/inf/nan treated as 0.
+ * Precision: ~1 nrad/s (gyro values are typically < 0.1 rad/s at rest).
+ */
+static s32 f32bits_to_nrads(u32 bits)
+{
+	u32 sign     = bits >> 31;
+	u32 exp      = (bits >> 23) & 0xFF;
+	u32 mantissa = bits & 0x7FFFFF;
+	s64 val;
+	int shift;
+
+	if (exp == 0 || exp == 0xFF)
+		return 0; /* subnormal / inf / nan → treat as 0 */
+
+	/* val = (1 + mantissa/2^23) × 2^(exp-127) × 1e9 */
+	/* = (2^23 + mantissa) × 2^(exp-127-23) × 1e9    */
+	val = (s64)(0x800000 | mantissa); /* 1.mantissa in Q23 */
+
+	shift = (int)exp - 127 - 23; /* net power of 2 */
+
+	/* Scale by 1e9 first (stays in s64 for gyro values < 100 rad/s) */
+	val *= 1000000000LL;
+
+	if (shift >= 0) {
+		if (shift < 40)
+			val <<= shift;
+		else
+			return sign ? S32_MIN : S32_MAX;
+	} else {
+		shift = -shift;
+		if (shift < 63)
+			val >>= shift;
+		else
+			val = 0;
+	}
+
+	return sign ? (s32)(-val) : (s32)(val);
+}
+
+/*
+ * Subtract bias (nrad/s) from a float value (stored as IEEE 754 bits).
+ * Returns modified float bits. Pure integer, no SSE.
+ */
+static u32 f32bits_sub_nrads(u32 bits, s32 bias_nrads)
+{
+	s32 val_nrads = f32bits_to_nrads(bits);
+	s32 corrected = val_nrads - bias_nrads;
+	u32 sign;
+	u32 abs_val;
+	u32 exp;
+	u32 mantissa;
+	int lz;
+
+	if (corrected == 0)
+		return 0;
+
+	sign    = (corrected < 0) ? 1u : 0u;
+	abs_val = (u32)(corrected < 0 ? -corrected : corrected);
+
+	/* Normalize: find highest set bit */
+	lz = __builtin_clz(abs_val);
+	exp = 127 + (31 - lz); /* exponent bias 127 */
+
+	/* Mantissa: shift abs_val to Q23 */
+	if (31 - lz >= 23)
+		mantissa = abs_val >> ((31 - lz) - 23);
+	else
+		mantissa = abs_val << (23 - (31 - lz));
+	mantissa &= 0x7FFFFF; /* strip implicit leading 1 */
+
+	/* Scale back: corrected is in nrad/s (×1e9), result should be rad/s */
+	/* We need to divide by 1e9 in float representation — adjust exponent */
+	/* log2(1e9) ≈ 29.897, so subtract 30 from exponent and compensate */
+	/* Simpler: just rebuild from corrected nrad/s by re-encoding */
+	(void)exp; (void)mantissa; /* unused — use direct re-encode below */
+
+	/*
+	 * Re-encode corrected nrad/s → IEEE 754 rad/s directly.
+	 * corrected is in units of 1e-9 rad/s.
+	 * We want float = corrected × 1e-9.
+	 * log2(1e-9) ≈ -29.897, so exp = 127 + exponent_of_corrected - 30.
+	 */
+	lz = __builtin_clz(abs_val);
+	{
+		int exp_val = 127 + (31 - lz) - 30; /* -30 ≈ log2(1e-9) */
+		u32 mant;
+
+		if (exp_val <= 0 || exp_val >= 255)
+			return 0; /* underflow/overflow → 0 */
+
+		if (31 - lz >= 23)
+			mant = abs_val >> ((31 - lz) - 23);
+		else
+			mant = abs_val << (23 - (31 - lz));
+		mant &= 0x7FFFFF;
+
+		return (sign << 31) | ((u32)exp_val << 23) | mant;
+	}
+}
+
+/* ---------- Gyro bias calibration workqueue ---------- */
+
+static void gyro_calib_work_fn(struct work_struct *work)
+{
+	struct wheeltec_dev *wd = container_of(work, struct wheeltec_dev, calib_work);
+	ktime_t deadline = ktime_add_ms(ktime_get(), 5000);
+	u32 bx, by, bz;
+
+	dev_info(&wd->intf->dev, "gyro calib: collecting bias for 5s (~2000 samples)...\n");
+
+	wd->gyro_sum_x = 0;
+	wd->gyro_sum_y = 0;
+	wd->gyro_sum_z = 0;
+	wd->gyro_calib_count = 0;
+
+	while (ktime_before(ktime_get(), deadline) && !wd->disconnected) {
+		if (!atomic_xchg(&wd->calib_sample_ready, 0)) {
+			usleep_range(500, 1000); /* wait ~1ms between polls */
+			continue;
+		}
+		bx = (u32)atomic_read(&wd->calib_gyro_x_bits);
+		by = (u32)atomic_read(&wd->calib_gyro_y_bits);
+		bz = (u32)atomic_read(&wd->calib_gyro_z_bits);
+		wd->gyro_sum_x += f32bits_to_nrads(bx);
+		wd->gyro_sum_y += f32bits_to_nrads(by);
+		wd->gyro_sum_z += f32bits_to_nrads(bz);
+		wd->gyro_calib_count++;
+	}
+
+	if (wd->disconnected || wd->gyro_calib_count == 0)
+		return;
+
+	wd->gyro_bias_x = (s32)(wd->gyro_sum_x / wd->gyro_calib_count);
+	wd->gyro_bias_y = (s32)(wd->gyro_sum_y / wd->gyro_calib_count);
+	wd->gyro_bias_z = (s32)(wd->gyro_sum_z / wd->gyro_calib_count);
+
+	/* Publish bias before setting done flag */
+	smp_wmb();
+	wd->gyro_calib_collecting = false;
+	wd->gyro_calib_done = true;
+
+	dev_info(&wd->intf->dev,
+		"gyro calib done: bias=(%d %d %d) nrad/s, n=%u\n",
+		wd->gyro_bias_x, wd->gyro_bias_y, wd->gyro_bias_z,
+		wd->gyro_calib_count);
+}
+
 static void publish_raw(struct wheeltec_dev *wd, const u8 *payload)
 {
 	struct wt_raw_frame snap;
@@ -687,6 +870,34 @@ static void publish_raw(struct wheeltec_dev *wd, const u8 *payload)
 	}
 	wd->raw_last_hw_ts = hw_ts;
 	snap.seq = ++wd->raw_fseq;
+
+	/* Feed raw float bits to calib workqueue (runs in process context) */
+	if (wd->gyro_calib_collecting) {
+		u32 bx, by, bz;
+
+		memcpy(&bx, &snap.gyro_x, 4);
+		memcpy(&by, &snap.gyro_y, 4);
+		memcpy(&bz, &snap.gyro_z, 4);
+		atomic_set(&wd->calib_gyro_x_bits, (int)bx);
+		atomic_set(&wd->calib_gyro_y_bits, (int)by);
+		atomic_set(&wd->calib_gyro_z_bits, (int)bz);
+		atomic_set(&wd->calib_sample_ready, 1);
+	}
+
+	/* Apply bias correction (pure integer soft-float, no SSE) */
+	if (wd->gyro_calib_done) {
+		u32 bx, by, bz;
+
+		memcpy(&bx, &snap.gyro_x, 4);
+		memcpy(&by, &snap.gyro_y, 4);
+		memcpy(&bz, &snap.gyro_z, 4);
+		bx = f32bits_sub_nrads(bx, wd->gyro_bias_x);
+		by = f32bits_sub_nrads(by, wd->gyro_bias_y);
+		bz = f32bits_sub_nrads(bz, wd->gyro_bias_z);
+		memcpy(&snap.gyro_x, &bx, 4);
+		memcpy(&snap.gyro_y, &by, 4);
+		memcpy(&snap.gyro_z, &bz, 4);
+	}
 
 	write_seqcount_begin(&wd->raw_seq);
 	wd->raw_snap = snap;
@@ -1065,14 +1276,18 @@ static ssize_t state_read(struct file *f, char __user *ubuf, size_t len, loff_t 
 	int ts = atomic_read(&wd->tare_status);
 
 	n = scnprintf(buf, sizeof(buf),
-		"connected=%d\nraw_frames_ok=%lld\nfilter_frames_ok=%lld\nframes_crc_err=%lld\nframes_dropped=%lld\nreboot_status=%s\ntare_status=%s\n",
+		"connected=%d\nraw_frames_ok=%lld\nfilter_frames_ok=%lld\nframes_crc_err=%lld\nframes_dropped=%lld\nreboot_status=%s\ntare_status=%s\ngyro_calib=%s\ngyro_bias_x_urad=%d\ngyro_bias_y_urad=%d\ngyro_bias_z_urad=%d\n",
 		!wd->disconnected,
 		(long long)atomic64_read(&wd->raw_frames_ok),
 		(long long)atomic64_read(&wd->filter_frames_ok),
 		(long long)atomic64_read(&wd->frames_crc_err),
 		(long long)atomic64_read(&wd->frames_dropped),
 		reboot_status_str[rs < 4 ? rs : 0],
-		reboot_status_str[ts < 4 ? ts : 0]);
+		reboot_status_str[ts < 4 ? ts : 0],
+		wd->gyro_calib_done ? "done" : (wd->gyro_calib_collecting ? "collecting" : "pending"),
+		wd->gyro_bias_x,
+		wd->gyro_bias_y,
+		wd->gyro_bias_z);
 
 	if (len < (size_t)n)
 		n = len;
@@ -1112,6 +1327,16 @@ static ssize_t ctrl_write(struct file *f, const char __user *ubuf,
 		if (atomic_cmpxchg(&wd->reboot_pending, 0, 1) != 0)
 			return -EBUSY;
 		schedule_work(&wd->reboot_work);
+		return len;
+	}
+
+	if (!strcmp(cmd, "recalib")) {
+		wd->gyro_calib_done       = false;
+		wd->gyro_calib_collecting = false;
+		wd->gyro_bias_x = 0;
+		wd->gyro_bias_y = 0;
+		wd->gyro_bias_z = 0;
+		dev_info(&wd->intf->dev, "gyro calib: reset, will recollect on next frame\n");
 		return len;
 	}
 
@@ -1261,6 +1486,7 @@ static int wheeltec_probe(struct usb_interface *intf,
 	INIT_WORK(&wd->urb_retry_work, urb_retry_work_fn);
 	INIT_WORK(&wd->reboot_work, wt_reboot_work_fn);
 	INIT_WORK(&wd->tare_work, wt_tare_work_fn);
+	INIT_WORK(&wd->calib_work, gyro_calib_work_fn);
 
 	wd->udev = usb_get_dev(udev);
 	wd->intf = intf;
@@ -1306,11 +1532,14 @@ static int wheeltec_probe(struct usb_interface *intf,
 		schedule_work(&wd->tare_work);
 		/* tare_work_fn will submit bulk_in_urb when done */
 	} else {
+		/* Reconnect after tare reboot — start stream then collect gyro bias */
 		rc = usb_submit_urb(wd->bulk_in_urb, GFP_KERNEL);
 		if (rc) {
 			dev_err(&intf->dev, "submit bulk-in urb failed: %d\n", rc);
 			goto err_misc;
 		}
+		wd->gyro_calib_collecting = true;
+		schedule_work(&wd->calib_work);
 	}
 
 	dev_info(&intf->dev,
@@ -1350,6 +1579,7 @@ static void wheeltec_disconnect(struct usb_interface *intf)
 	cancel_work_sync(&wd->urb_retry_work);
 	cancel_work_sync(&wd->reboot_work);
 	cancel_work_sync(&wd->tare_work);
+	cancel_work_sync(&wd->calib_work);
 
 	wheeltec_unregister_misc(wd);
 
@@ -1374,6 +1604,7 @@ static int wheeltec_pre_reset(struct usb_interface *intf)
 	cancel_work_sync(&wd->urb_retry_work);
 	cancel_work_sync(&wd->reboot_work);
 	cancel_work_sync(&wd->tare_work);
+	cancel_work_sync(&wd->calib_work);
 	return 0;
 }
 
