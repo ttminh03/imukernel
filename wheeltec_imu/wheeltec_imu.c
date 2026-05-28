@@ -740,10 +740,8 @@ static s32 f32bits_to_nrads(u32 bits)
 	return sign ? (s32)(-val) : (s32)(val);
 }
 
-/*
- * Subtract bias (nrad/s) from a float value (stored as IEEE 754 bits).
- * Returns modified float bits. Pure integer, no SSE.
- */
+/* Disabled — used only by bias correction which is currently off. */
+#if 0
 static u32 f32bits_sub_nrads(u32 bits, s32 bias_nrads)
 {
 	s32 val_nrads = f32bits_to_nrads(bits);
@@ -800,6 +798,7 @@ static u32 f32bits_sub_nrads(u32 bits, s32 bias_nrads)
 		return (sign << 31) | ((u32)exp_val << 23) | mant;
 	}
 }
+#endif
 
 /* ---------- Gyro bias calibration workqueue ---------- */
 
@@ -871,33 +870,24 @@ static void publish_raw(struct wheeltec_dev *wd, const u8 *payload)
 	wd->raw_last_hw_ts = hw_ts;
 	snap.seq = ++wd->raw_fseq;
 
-	/* Feed raw float bits to calib workqueue (runs in process context) */
-	if (wd->gyro_calib_collecting) {
-		u32 bx, by, bz;
-
-		memcpy(&bx, &snap.gyro_x, 4);
-		memcpy(&by, &snap.gyro_y, 4);
-		memcpy(&bz, &snap.gyro_z, 4);
-		atomic_set(&wd->calib_gyro_x_bits, (int)bx);
-		atomic_set(&wd->calib_gyro_y_bits, (int)by);
-		atomic_set(&wd->calib_gyro_z_bits, (int)bz);
-		atomic_set(&wd->calib_sample_ready, 1);
-	}
-
-	/* Apply bias correction (pure integer soft-float, no SSE) */
-	if (wd->gyro_calib_done) {
-		u32 bx, by, bz;
-
-		memcpy(&bx, &snap.gyro_x, 4);
-		memcpy(&by, &snap.gyro_y, 4);
-		memcpy(&bz, &snap.gyro_z, 4);
-		bx = f32bits_sub_nrads(bx, wd->gyro_bias_x);
-		by = f32bits_sub_nrads(by, wd->gyro_bias_y);
-		bz = f32bits_sub_nrads(bz, wd->gyro_bias_z);
-		memcpy(&snap.gyro_x, &bx, 4);
-		memcpy(&snap.gyro_y, &by, 4);
-		memcpy(&snap.gyro_z, &bz, 4);
-	}
+	/* Gyro bias calibration disabled — raw data passed through unmodified.
+	 * if (wd->gyro_calib_collecting) {
+	 *     u32 bx, by, bz;
+	 *     memcpy(&bx, &snap.gyro_x, 4); memcpy(&by, &snap.gyro_y, 4); memcpy(&bz, &snap.gyro_z, 4);
+	 *     atomic_set(&wd->calib_gyro_x_bits, (int)bx);
+	 *     atomic_set(&wd->calib_gyro_y_bits, (int)by);
+	 *     atomic_set(&wd->calib_gyro_z_bits, (int)bz);
+	 *     atomic_set(&wd->calib_sample_ready, 1);
+	 * }
+	 * if (wd->gyro_calib_done) {
+	 *     u32 bx, by, bz;
+	 *     memcpy(&bx, &snap.gyro_x, 4); memcpy(&by, &snap.gyro_y, 4); memcpy(&bz, &snap.gyro_z, 4);
+	 *     bx = f32bits_sub_nrads(bx, wd->gyro_bias_x);
+	 *     by = f32bits_sub_nrads(by, wd->gyro_bias_y);
+	 *     bz = f32bits_sub_nrads(bz, wd->gyro_bias_z);
+	 *     memcpy(&snap.gyro_x, &bx, 4); memcpy(&snap.gyro_y, &by, 4); memcpy(&snap.gyro_z, &bz, 4);
+	 * }
+	 */
 
 	write_seqcount_begin(&wd->raw_seq);
 	wd->raw_snap = snap;
@@ -1340,37 +1330,17 @@ static ssize_t ctrl_write(struct file *f, const char __user *ubuf,
 		return len;
 	}
 
-	/*
-	 * tare:<type>:<wait_ms>
-	 *   type    : gyro | accel | level
-	 *   wait_ms : thời gian chờ calibration (ms), ví dụ 2500
-	 *
-	 * Ví dụ: "tare:gyro:2500"
-	 *        "tare:level:5000"
-	 */
 	if (!strncmp(cmd, "tare:", 5)) {
-		char type_str[16];
-		int wait_ms = 2500;
-		int tare_type;
-
-		if (sscanf(cmd + 5, "%15[^:]:%d", type_str, &wait_ms) < 1)
-			return -EINVAL;
-
+		char type_str[16]; int wait_ms = 2500; int tare_type;
+		if (sscanf(cmd + 5, "%15[^:]:%d", type_str, &wait_ms) < 1) return -EINVAL;
 		if (!strcmp(type_str, "gyro"))       tare_type = 0;
 		else if (!strcmp(type_str, "accel")) tare_type = 1;
 		else if (!strcmp(type_str, "level")) tare_type = 2;
 		else return -EINVAL;
-
-		if (wait_ms < 100 || wait_ms > 60000)
-			return -EINVAL;
-
-		if (atomic_cmpxchg(&wd->tare_pending, 0, 1) != 0)
-			return -EBUSY;
-
-		wd->tare_type    = tare_type;
-		wd->tare_wait_ms = wait_ms;
-		schedule_work(&wd->tare_work);
-		return len;
+		if (wait_ms < 100 || wait_ms > 60000) return -EINVAL;
+		if (atomic_cmpxchg(&wd->tare_pending, 0, 1) != 0) return -EBUSY;
+		wd->tare_type = tare_type; wd->tare_wait_ms = wait_ms;
+		schedule_work(&wd->tare_work); return len;
 	}
 
 	return -EINVAL;
@@ -1523,23 +1493,18 @@ static int wheeltec_probe(struct usb_interface *intf,
 	usb_set_intfdata(intf, wd);
 
 	if (!wd->startup_tare_done) {
-		/* First bind: run gyro tare before starting stream */
 		dev_info(&intf->dev, "wheeltec_imu%d: running startup gyro tare...\n", wd->id);
-		wd->tare_type    = 0; /* gyro */
+		wd->tare_type = 0;
 		wd->tare_wait_ms = 2500;
 		atomic_set(&wd->tare_pending, 1);
 		wd->startup_tare_done = true;
 		schedule_work(&wd->tare_work);
-		/* tare_work_fn will submit bulk_in_urb when done */
 	} else {
-		/* Reconnect after tare reboot — start stream then collect gyro bias */
 		rc = usb_submit_urb(wd->bulk_in_urb, GFP_KERNEL);
 		if (rc) {
 			dev_err(&intf->dev, "submit bulk-in urb failed: %d\n", rc);
 			goto err_misc;
 		}
-		wd->gyro_calib_collecting = true;
-		schedule_work(&wd->calib_work);
 	}
 
 	dev_info(&intf->dev,
