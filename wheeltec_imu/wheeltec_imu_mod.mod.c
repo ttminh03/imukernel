@@ -1,7 +1,20 @@
 #include <linux/module.h>
+#define INCLUDE_VERMAGIC
+#include <linux/build-salt.h>
+#include <linux/elfnote-lto.h>
 #include <linux/export-internal.h>
+#include <linux/vermagic.h>
 #include <linux/compiler.h>
 
+#ifdef CONFIG_UNWINDER_ORC
+#include <asm/orc_header.h>
+ORC_HEADER;
+#endif
+
+BUILD_SALT;
+BUILD_LTO_INFO;
+
+MODULE_INFO(vermagic, VERMAGIC_STRING);
 MODULE_INFO(name, KBUILD_MODNAME);
 
 __visible struct module __this_module
@@ -14,202 +27,81 @@ __section(".gnu.linkonce.this_module") = {
 	.arch = MODULE_ARCH_INIT,
 };
 
+#ifdef CONFIG_MITIGATION_RETPOLINE
+MODULE_INFO(retpoline, "Y");
+#endif
+
 KSYMTAB_DATA(cp_crc8_table, "", "");
 KSYMTAB_DATA(cp_crc16_table, "", "");
 
-SYMBOL_CRC(cp_crc8_table, 0x1690648c, "");
-SYMBOL_CRC(cp_crc16_table, 0x85a93ed1, "");
+SYMBOL_CRC(cp_crc8_table, 0xbb5f28e7, "");
+SYMBOL_CRC(cp_crc16_table, 0x43286ac7, "");
 
 static const struct modversion_info ____versions[]
 __used __section("__versions") = {
-	{ 0x0dba6eb8, "usb_alloc_urb" },
-	{ 0xd98156e2, "ida_alloc_range" },
-	{ 0xa61fd7aa, "__check_object_size" },
-	{ 0xf5270aff, "misc_deregister" },
-	{ 0xd6d46b9d, "usb_free_urb" },
-	{ 0xc2614bbe, "param_ops_uint" },
-	{ 0x092a35a2, "_copy_from_user" },
-	{ 0xd710adbf, "__kmalloc_noprof" },
-	{ 0xa53f4e29, "memmove" },
-	{ 0x40a621c5, "snprintf" },
-	{ 0x49733ad6, "queue_work_on" },
-	{ 0xc87f4bab, "finish_wait" },
-	{ 0xaba46e12, "usb_register_driver" },
-	{ 0x40a621c5, "scnprintf" },
-	{ 0xa53f4e29, "memcpy" },
-	{ 0xcb8b6ec6, "kfree" },
-	{ 0x0feb1e94, "usleep_range_state" },
-	{ 0x0db8d68d, "prepare_to_wait_event" },
-	{ 0x16ab4215, "__wake_up" },
-	{ 0xd272d446, "__fentry__" },
-	{ 0x2bd64ad0, "usb_find_common_endpoints" },
-	{ 0x5a844b26, "__x86_indirect_thunk_rax" },
-	{ 0xe37614eb, "___ratelimit" },
-	{ 0xd272d446, "schedule" },
-	{ 0x5d5b6583, "usb_put_dev" },
-	{ 0x76a26ca1, "usb_bulk_msg" },
-	{ 0xd272d446, "__stack_chk_fail" },
-	{ 0xf64ac983, "__copy_overflow" },
-	{ 0xa9289d30, "usb_get_dev" },
-	{ 0x0819dba7, "usb_submit_urb" },
-	{ 0x9878df8a, "_dev_info" },
-	{ 0x90a48d82, "__ubsan_handle_out_of_bounds" },
-	{ 0x7a5ffe84, "init_wait_entry" },
-	{ 0x9878df8a, "_dev_err" },
-	{ 0xbd03ed67, "random_kmalloc_seed" },
-	{ 0x837202b8, "usb_control_msg" },
-	{ 0x4c3d335e, "ida_free" },
-	{ 0x173ec8da, "sscanf" },
-	{ 0xc1e6c71e, "__mutex_init" },
-	{ 0xef4e4365, "usb_deregister" },
-	{ 0x9878df8a, "_dev_warn" },
-	{ 0xd33d3223, "misc_register" },
-	{ 0xd272d446, "__x86_return_thunk" },
-	{ 0x386e4ba3, "kmemdup_noprof" },
-	{ 0x092a35a2, "_copy_to_user" },
-	{ 0x5403c125, "__init_waitqueue_head" },
-	{ 0x6514c3b7, "strcspn" },
-	{ 0x70db3fe4, "__kmalloc_cache_noprof" },
-	{ 0xd6d46b9d, "usb_kill_urb" },
-	{ 0x97acb853, "ktime_get" },
-	{ 0x2d88a3ab, "cancel_work_sync" },
-	{ 0x75738bed, "__warn_printk" },
-	{ 0xe4de56b4, "__ubsan_handle_load_invalid_value" },
-	{ 0x67628f51, "msleep" },
-	{ 0x12ca6142, "ktime_get_with_offset" },
-	{ 0x7851be11, "__SCT__might_resched" },
-	{ 0xfed1e3bc, "kmalloc_caches" },
-	{ 0xaef1f20d, "system_wq" },
-	{ 0xba157484, "module_layout" },
+	{ 0xe859704b, "usb_alloc_urb" },
+	{ 0xe7a02573, "ida_alloc_range" },
+	{ 0x88db9f48, "__check_object_size" },
+	{ 0x2556884a, "misc_deregister" },
+	{ 0x6fe8a202, "usb_free_urb" },
+	{ 0xedfbc05a, "param_ops_uint" },
+	{ 0x13c49cc2, "_copy_from_user" },
+	{ 0xb0e602eb, "memmove" },
+	{ 0x656e4a6e, "snprintf" },
+	{ 0xc5b6f236, "queue_work_on" },
+	{ 0x92540fbf, "finish_wait" },
+	{ 0xfa0bde56, "usb_register_driver" },
+	{ 0x96848186, "scnprintf" },
+	{ 0x69acdf38, "memcpy" },
+	{ 0x37a0cba, "kfree" },
+	{ 0xc3055d20, "usleep_range_state" },
+	{ 0x8c26d495, "prepare_to_wait_event" },
+	{ 0xe2964344, "__wake_up" },
+	{ 0xbdfb6dbb, "__fentry__" },
+	{ 0x93c7edeb, "usb_find_common_endpoints" },
+	{ 0x65487097, "__x86_indirect_thunk_rax" },
+	{ 0x1d24c881, "___ratelimit" },
+	{ 0x1000e51, "schedule" },
+	{ 0x808fc694, "usb_put_dev" },
+	{ 0x97a84c7f, "usb_bulk_msg" },
+	{ 0xf0fdf6cb, "__stack_chk_fail" },
+	{ 0x7682ba4e, "__copy_overflow" },
+	{ 0xbc4715dc, "usb_get_dev" },
+	{ 0x3173741f, "usb_submit_urb" },
+	{ 0xf1e7991b, "_dev_info" },
+	{ 0x87a21cb3, "__ubsan_handle_out_of_bounds" },
+	{ 0xfe487975, "init_wait_entry" },
+	{ 0x22efd784, "_dev_err" },
+	{ 0x4c03a563, "random_kmalloc_seed" },
+	{ 0xfd553160, "usb_control_msg" },
+	{ 0xffb7c514, "ida_free" },
+	{ 0xbcab6ee6, "sscanf" },
+	{ 0xcefb0c9f, "__mutex_init" },
+	{ 0xf61f6a42, "usb_deregister" },
+	{ 0xac8d440e, "_dev_warn" },
+	{ 0xa27f77ea, "misc_register" },
+	{ 0x5b8239ca, "__x86_return_thunk" },
+	{ 0x6b10bee1, "_copy_to_user" },
+	{ 0xd9a5ea54, "__init_waitqueue_head" },
+	{ 0x1ac5d3cb, "strcspn" },
+	{ 0x66b4cc41, "kmemdup" },
+	{ 0x1103880, "usb_kill_urb" },
+	{ 0xb43f9365, "ktime_get" },
+	{ 0x3c12dfe, "cancel_work_sync" },
+	{ 0x56470118, "__warn_printk" },
+	{ 0xd0e4bdda, "kmalloc_trace" },
+	{ 0x54b1fac6, "__ubsan_handle_load_invalid_value" },
+	{ 0xf9a482f9, "msleep" },
+	{ 0xc4f0da12, "ktime_get_with_offset" },
+	{ 0xeb233a45, "__kmalloc" },
+	{ 0xe2c17b5d, "__SCT__might_resched" },
+	{ 0xf116693b, "kmalloc_caches" },
+	{ 0x2d3385d3, "system_wq" },
+	{ 0x907364e, "module_layout" },
 };
-
-static const u32 ____version_ext_crcs[]
-__used __section("__version_ext_crcs") = {
-	0x0dba6eb8,
-	0xd98156e2,
-	0xa61fd7aa,
-	0xf5270aff,
-	0xd6d46b9d,
-	0xc2614bbe,
-	0x092a35a2,
-	0xd710adbf,
-	0xa53f4e29,
-	0x40a621c5,
-	0x49733ad6,
-	0xc87f4bab,
-	0xaba46e12,
-	0x40a621c5,
-	0xa53f4e29,
-	0xcb8b6ec6,
-	0x0feb1e94,
-	0x0db8d68d,
-	0x16ab4215,
-	0xd272d446,
-	0x2bd64ad0,
-	0x5a844b26,
-	0xe37614eb,
-	0xd272d446,
-	0x5d5b6583,
-	0x76a26ca1,
-	0xd272d446,
-	0xf64ac983,
-	0xa9289d30,
-	0x0819dba7,
-	0x9878df8a,
-	0x90a48d82,
-	0x7a5ffe84,
-	0x9878df8a,
-	0xbd03ed67,
-	0x837202b8,
-	0x4c3d335e,
-	0x173ec8da,
-	0xc1e6c71e,
-	0xef4e4365,
-	0x9878df8a,
-	0xd33d3223,
-	0xd272d446,
-	0x386e4ba3,
-	0x092a35a2,
-	0x5403c125,
-	0x6514c3b7,
-	0x70db3fe4,
-	0xd6d46b9d,
-	0x97acb853,
-	0x2d88a3ab,
-	0x75738bed,
-	0xe4de56b4,
-	0x67628f51,
-	0x12ca6142,
-	0x7851be11,
-	0xfed1e3bc,
-	0xaef1f20d,
-	0xba157484,
-};
-static const char ____version_ext_names[]
-__used __section("__version_ext_names") =
-	"usb_alloc_urb\0"
-	"ida_alloc_range\0"
-	"__check_object_size\0"
-	"misc_deregister\0"
-	"usb_free_urb\0"
-	"param_ops_uint\0"
-	"_copy_from_user\0"
-	"__kmalloc_noprof\0"
-	"memmove\0"
-	"snprintf\0"
-	"queue_work_on\0"
-	"finish_wait\0"
-	"usb_register_driver\0"
-	"scnprintf\0"
-	"memcpy\0"
-	"kfree\0"
-	"usleep_range_state\0"
-	"prepare_to_wait_event\0"
-	"__wake_up\0"
-	"__fentry__\0"
-	"usb_find_common_endpoints\0"
-	"__x86_indirect_thunk_rax\0"
-	"___ratelimit\0"
-	"schedule\0"
-	"usb_put_dev\0"
-	"usb_bulk_msg\0"
-	"__stack_chk_fail\0"
-	"__copy_overflow\0"
-	"usb_get_dev\0"
-	"usb_submit_urb\0"
-	"_dev_info\0"
-	"__ubsan_handle_out_of_bounds\0"
-	"init_wait_entry\0"
-	"_dev_err\0"
-	"random_kmalloc_seed\0"
-	"usb_control_msg\0"
-	"ida_free\0"
-	"sscanf\0"
-	"__mutex_init\0"
-	"usb_deregister\0"
-	"_dev_warn\0"
-	"misc_register\0"
-	"__x86_return_thunk\0"
-	"kmemdup_noprof\0"
-	"_copy_to_user\0"
-	"__init_waitqueue_head\0"
-	"strcspn\0"
-	"__kmalloc_cache_noprof\0"
-	"usb_kill_urb\0"
-	"ktime_get\0"
-	"cancel_work_sync\0"
-	"__warn_printk\0"
-	"__ubsan_handle_load_invalid_value\0"
-	"msleep\0"
-	"ktime_get_with_offset\0"
-	"__SCT__might_resched\0"
-	"kmalloc_caches\0"
-	"system_wq\0"
-	"module_layout\0"
-;
 
 MODULE_INFO(depends, "");
 
 MODULE_ALIAS("usb:v10C4pE100d*dc*dsc*dp*ic*isc*ip*in*");
 
-MODULE_INFO(srcversion, "C85A3162B4BC523133F39A1");
+MODULE_INFO(srcversion, "AB22203E09FE67295EA2A58");

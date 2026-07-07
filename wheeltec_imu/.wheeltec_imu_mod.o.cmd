@@ -1,1 +1,1 @@
-savedcmd_wheeltec_imu_mod.o := ld -m elf_x86_64 -z noexecstack --no-warn-rwx-segments   -r -o wheeltec_imu_mod.o @wheeltec_imu_mod.mod 
+savedcmd_/home/minh/congty/imukernel/wheeltec_imu/wheeltec_imu_mod.o := ld -m elf_x86_64 -z noexecstack   -r -o /home/minh/congty/imukernel/wheeltec_imu/wheeltec_imu_mod.o @/home/minh/congty/imukernel/wheeltec_imu/wheeltec_imu_mod.mod 

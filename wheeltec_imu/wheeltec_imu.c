@@ -1357,10 +1357,10 @@ static int wheeltec_register_misc(struct wheeltec_dev *wd)
 {
 	int rc;
 
-	snprintf(wd->name_raw,    sizeof(wd->name_raw),    "wheeltec_imu%d_raw",    wd->id);
-	snprintf(wd->name_filter, sizeof(wd->name_filter), "wheeltec_imu%d_filter", wd->id);
-	snprintf(wd->name_state,  sizeof(wd->name_state),  "wheeltec_imu%d_state",  wd->id);
-	snprintf(wd->name_ctrl,   sizeof(wd->name_ctrl),   "wheeltec_imu%d_ctrl",   wd->id);
+	snprintf(wd->name_raw,    sizeof(wd->name_raw),    "imu/0/wheeltec_imu%d_raw",    wd->id);
+	snprintf(wd->name_filter, sizeof(wd->name_filter), "imu/0/wheeltec_imu%d_filter", wd->id);
+	snprintf(wd->name_state,  sizeof(wd->name_state),  "imu/0/wheeltec_imu%d_state",  wd->id);
+	snprintf(wd->name_ctrl,   sizeof(wd->name_ctrl),   "imu/0/wheeltec_imu%d_ctrl",   wd->id);
 
 	wd->mdev_raw.minor  = MISC_DYNAMIC_MINOR;
 	wd->mdev_raw.name   = wd->name_raw;

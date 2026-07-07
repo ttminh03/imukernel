@@ -1,5 +1,5 @@
 /*
- * check_frequency.c — đo tần số frame từ /dev/wheeltec_imu0_raw và _filter
+ * check_frequency.c — đo tần số frame từ /dev/imu/0/wheeltec_imu0_raw và _filter
  *
  * Build: gcc -O2 -o check_frequency check_frequency.c
  * Run:   sudo ./check_frequency [device_index]   (mặc định index=0)
@@ -170,8 +170,8 @@ int main(int argc, char *argv[])
 	uint64_t next_print;
 	uint64_t next_retry = 0;
 
-	snprintf(path_raw,    sizeof(path_raw),    "/dev/wheeltec_imu%d_raw",    idx);
-	snprintf(path_filter, sizeof(path_filter), "/dev/wheeltec_imu%d_filter", idx);
+	snprintf(path_raw,    sizeof(path_raw),    "/dev/imu/0/wheeltec_imu%d_raw",    idx);
+	snprintf(path_filter, sizeof(path_filter), "/dev/imu/0/wheeltec_imu%d_filter", idx);
 	raw.name   = path_raw;
 	filt.name  = path_filter;
 	raw.fd     = -1;

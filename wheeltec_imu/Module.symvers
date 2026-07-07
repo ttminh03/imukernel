@@ -1,2 +1,2 @@
-0x1690648c	cp_crc8_table	wheeltec_imu_mod	EXPORT_SYMBOL	
-0x85a93ed1	cp_crc16_table	wheeltec_imu_mod	EXPORT_SYMBOL	
+0xbb5f28e7	cp_crc8_table	/home/minh/congty/imukernel/wheeltec_imu/wheeltec_imu_mod	EXPORT_SYMBOL	
+0x43286ac7	cp_crc16_table	/home/minh/congty/imukernel/wheeltec_imu/wheeltec_imu_mod	EXPORT_SYMBOL	

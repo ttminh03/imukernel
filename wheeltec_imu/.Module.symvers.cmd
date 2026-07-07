@@ -1,1 +1,1 @@
-savedcmd_Module.symvers :=  /usr/src/linux-headers-6.14.0-37-generic/scripts/mod/modpost -M -m -b -x -a      -o Module.symvers -T modules.order -i /usr/src/linux-headers-6.14.0-37-generic/Module.symvers -e 
+savedcmd_/home/minh/congty/imukernel/wheeltec_imu/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/minh/congty/imukernel/wheeltec_imu/Module.symvers -T /home/minh/congty/imukernel/wheeltec_imu/modules.order -i Module.symvers -e 

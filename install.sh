@@ -54,7 +54,7 @@ info "Module đã cài vào /lib/modules/$KERNEL_VER/extra/"
 # ============================================================
 info "Bước 3/3 — Tạo udev rule..."
 cat > "$UDEV_RULE" << 'EOF'
-SUBSYSTEM=="misc", KERNEL=="wheeltec_imu*", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="misc", KERNEL=="imu/0/wheeltec_imu*", GROUP="dialout", MODE="0660"
 EOF
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=misc
